@@ -20,5 +20,5 @@ echo "deb http://nightly.odoo.com/$version/nightly/deb/ ./" >> /etc/apt/sources.
 # Update and install
 apt-get update && apt-get install odoo
 
-
+echo ">>> Para comenzar a usar Odoo, desde su navegador acceda a http://tu-ip:8069/ <<<"
 
