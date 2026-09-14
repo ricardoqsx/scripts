@@ -17,6 +17,11 @@ Si la descarga, extracción o ejecución inicial falla, el script conserva los a
 
 ## Atajos de esta primera iteración
 
+En todas las aplicaciones, incluidos los terminales:
+
+- `⌘Tab` → `Alt+Tab`: siguiente aplicación/ventana de KWin.
+- `⌘⇧Tab` → `Alt+⇧Tab`: aplicación/ventana anterior de KWin.
+
 Fuera de terminales, se mapean estos atajos:
 
 `⌘C`, `⌘X`, `⌘V`, `⌘A`, `⌘Z`, `⌘⇧Z`, `⌘F`, `⌘S`, `⌘⇧S`, `⌘O`, `⌘N`, `⌘W`, `⌘P`.
@@ -42,6 +47,12 @@ Si el repositorio ya está clonado:
 
 ```bash
 chmod +x ./kde-macos-keymap && ./kde-macos-keymap apply
+```
+
+Para actualizar los atajos tras obtener una versión nueva del repositorio, sin reinstalar ni modificar permisos:
+
+```bash
+git pull && ./kde-macos-keymap update
 ```
 
 ## Uso en la máquina virtual

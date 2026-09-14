@@ -45,6 +45,7 @@ Comandos:
   status   Muestra requisitos y el estado de la instalación.
   backup   Crea un respaldo del estado administrado por este proyecto.
   apply    Respalda y activa los atajos. Puede solicitar sudo.
+  update   Respalda y actualiza la configuración de atajos ya instalada.
   restore [--purge]  Desactiva el servicio y revierte los cambios registrados.
   help     Muestra esta ayuda.
 
@@ -166,6 +167,12 @@ write_config() {
 # Gestionado por kde-macos-keymap. No editar: se regenerará con `apply`.
 # Las reglas específicas deben ir antes de la regla general en xremap.
 keymap:
+  - name: macOS application switcher
+    exact_match: true
+    remap:
+      Super-Tab: M-Tab
+      Super-Shift-Tab: M-Shift-Tab
+
   - name: Terminal copy and paste
     application:
       only: [org.kde.konsole, Konsole, konsole, org.wezfurlong.wezterm, WezTerm, Alacritty, kitty, org.gnome.Terminal]
@@ -333,6 +340,13 @@ apply() {
   fi
 }
 
+update() {
+  [[ -f "$STATE_FILE" ]] || die "No hay una instalación registrada. Ejecuta apply antes de update."
+  backup
+  write_config
+  note "Configuración actualizada. xremap la recargará automáticamente si está en ejecución."
+}
+
 restore() {
   [[ -f "$STATE_FILE" ]] || die "No hay una instalación registrada por $APP_NAME. No se modificó nada."
   local input_added="" xremap_installed="" key value
@@ -376,7 +390,7 @@ while [[ $# -gt 0 ]]; do
       PURGE_XREMAP=true
       shift
       ;;
-    status|backup|apply|restore) command_name="$1"; shift ;;
+    status|backup|apply|update|restore) command_name="$1"; shift ;;
     *) die "Argumento desconocido: $1" ;;
   esac
 done
