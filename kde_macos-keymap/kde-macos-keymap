@@ -59,9 +59,21 @@ require_kde_wayland() {
     die "Se requiere KDE Plasma; escritorio detectado: ${XDG_CURRENT_DESKTOP:-desconocido}."
 }
 
-require_kde_xremap() {
-  "$XREMAP_BINARY" --list-desktops 2>/dev/null | command grep -qw kde || \
-    die "xremap no incluye el backend KDE requerido."
+validate_xremap_runtime() {
+  local version_output
+  if ! version_output="$("$XREMAP_BINARY" --version 2>&1)"; then
+    printf 'Error: xremap no se pudo ejecutar:\n%s\n' "$version_output" >&2
+    die "Corrige el error anterior antes de continuar."
+  fi
+  note "xremap detectado: ${version_output%%$'\n'*}"
+}
+
+save_failed_download() {
+  local temporary_dir="$1" diagnostic_dir
+  diagnostic_dir="$STATE_DIR/download-failures/$(date -u +%Y%m%dT%H%M%SZ)"
+  mkdir -p "$(dirname "$diagnostic_dir")"
+  mv -- "$temporary_dir" "$diagnostic_dir"
+  printf '%s\n' "$diagnostic_dir"
 }
 
 install_download_dependencies() {
@@ -77,7 +89,7 @@ install_download_dependencies() {
 }
 
 install_xremap() {
-  local architecture asset sha256 url temporary_dir archive actual_sha256
+  local architecture asset sha256 url temporary_dir archive actual_sha256 version_output diagnostic_dir
   case "$(uname -m)" in
     x86_64|amd64)
       architecture=x86_64
@@ -100,20 +112,36 @@ install_xremap() {
   install_download_dependencies
   temporary_dir="$(mktemp -d)"
   archive="$temporary_dir/$asset"
-  curl --fail --location --proto '=https' --tlsv1.2 --output "$archive" "$url"
+  if ! curl --fail --location --proto '=https' --tlsv1.2 --output "$archive" "$url"; then
+    diagnostic_dir="$(save_failed_download "$temporary_dir")"
+    die "No se pudo descargar xremap; archivos de diagnóstico conservados en $diagnostic_dir."
+  fi
   actual_sha256="$(sha256sum "$archive" | cut -d ' ' -f 1)"
-  [[ "$actual_sha256" == "$sha256" ]] || die "La suma SHA-256 de xremap no coincide; se canceló la instalación."
-  unzip -q "$archive" -d "$temporary_dir/extract"
-  [[ -x "$temporary_dir/extract/xremap" ]] || die "El archivo descargado no contiene el binario xremap esperado."
-  mkdir -p "$MANAGED_XREMAP_DIR"
-  install -m 0755 "$temporary_dir/extract/xremap" "$MANAGED_XREMAP"
+  if [[ "$actual_sha256" != "$sha256" ]]; then
+    diagnostic_dir="$(save_failed_download "$temporary_dir")"
+    die "La suma SHA-256 de xremap no coincide; archivos conservados en $diagnostic_dir."
+  fi
+  if ! unzip -q "$archive" -d "$temporary_dir/extract"; then
+    diagnostic_dir="$(save_failed_download "$temporary_dir")"
+    die "No se pudo extraer xremap; archivos de diagnóstico conservados en $diagnostic_dir."
+  fi
+  if [[ ! -x "$temporary_dir/extract/xremap" ]]; then
+    diagnostic_dir="$(save_failed_download "$temporary_dir")"
+    die "El archivo descargado no contiene el binario xremap esperado; archivos conservados en $diagnostic_dir."
+  fi
+  if ! version_output="$("$temporary_dir/extract/xremap" --version 2>&1)"; then
+    diagnostic_dir="$(save_failed_download "$temporary_dir")"
+    printf 'Error: el binario descargado no se pudo ejecutar:\n%s\n' "$version_output" >&2
+    die "Archivos de diagnóstico conservados en $diagnostic_dir."
+  fi
+  if ! mkdir -p "$MANAGED_XREMAP_DIR" || ! install -m 0755 "$temporary_dir/extract/xremap" "$MANAGED_XREMAP"; then
+    rm -rf -- "$MANAGED_XREMAP_DIR"
+    die "No se pudo instalar xremap en $MANAGED_XREMAP_DIR."
+  fi
   XREMAP_BINARY="$MANAGED_XREMAP"
   XREMAP_INSTALLED_BY_SCRIPT=yes
-  if ! "$XREMAP_BINARY" --list-desktops 2>/dev/null | command grep -qw kde; then
-    rm -rf -- "$MANAGED_XREMAP_DIR" "$temporary_dir"
-    die "El binario descargado de xremap no incluye el backend KDE requerido."
-  fi
   rm -rf -- "$temporary_dir"
+  note "xremap instalado: ${version_output%%$'\n'*}"
 }
 
 ensure_xremap() {
@@ -125,7 +153,7 @@ ensure_xremap() {
     install_xremap
   fi
   if ! "$DRY_RUN"; then
-    require_kde_xremap
+    validate_xremap_runtime
   fi
 }
 

@@ -13,6 +13,8 @@ Si `xremap` no existe, `apply` instala automáticamente la variante oficial para
 
 No sobrescribe un xremap existente ni instala binarios de terceros como root. La copia administrada queda en `~/.local/lib/kde-macos-keymap/`.
 
+Si la descarga, extracción o ejecución inicial falla, el script conserva los archivos temporales en `~/.local/state/kde-macos-keymap/download-failures/` e imprime la ruta exacta y el error original para facilitar el diagnóstico.
+
 ## Atajos de esta primera iteración
 
 Fuera de terminales, se mapean estos atajos:
