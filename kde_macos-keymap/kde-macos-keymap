@@ -1,0 +1,361 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Map selected Apple Command (Super) shortcuts to Ctrl on KDE Plasma Wayland.
+
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+readonly APP_NAME="kde-macos-keymap"
+readonly CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/$APP_NAME"
+readonly STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/$APP_NAME"
+readonly UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+readonly CONFIG_FILE="$CONFIG_DIR/xremap.yml"
+readonly UNIT_FILE="$UNIT_DIR/$APP_NAME.service"
+readonly UDEV_FILE="/etc/udev/rules.d/99-$APP_NAME-uinput.rules"
+readonly MODULE_FILE="/etc/modules-load.d/$APP_NAME.conf"
+readonly STATE_FILE="$STATE_DIR/installation.env"
+readonly XREMAP_VERSION="0.15.13"
+readonly XREMAP_BASE_DIR="$HOME/.local/lib/$APP_NAME"
+readonly MANAGED_XREMAP_DIR="$XREMAP_BASE_DIR/xremap-$XREMAP_VERSION"
+readonly MANAGED_XREMAP="$MANAGED_XREMAP_DIR/xremap"
+
+DRY_RUN=false
+PURGE_XREMAP=false
+XREMAP_BINARY=""
+XREMAP_INSTALLED_BY_SCRIPT=no
+
+die() { printf 'Error: %s\n' "$*" >&2; exit 1; }
+note() { printf '%s\n' "$*"; }
+run() {
+  if "$DRY_RUN"; then
+    printf '+ '
+    printf '%q ' "$@"
+    printf '\n'
+  else
+    "$@"
+  fi
+}
+sudo_run() { run sudo "$@"; }
+
+usage() {
+  cat <<'EOF'
+Uso: kde-macos-keymap [--dry-run] <comando>
+
+Comandos:
+  status   Muestra requisitos y el estado de la instalación.
+  backup   Crea un respaldo del estado administrado por este proyecto.
+  apply    Respalda y activa los atajos. Puede solicitar sudo.
+  restore [--purge]  Desactiva el servicio y revierte los cambios registrados.
+  help     Muestra esta ayuda.
+
+apply instala xremap automáticamente si no está disponible. `restore --purge`
+elimina también la copia de xremap instalada por este script.
+EOF
+}
+
+require_kde_wayland() {
+  [[ "${XDG_SESSION_TYPE:-}" == "wayland" ]] || die "Se requiere una sesión Wayland."
+  [[ "${XDG_CURRENT_DESKTOP:-}${DESKTOP_SESSION:-}" =~ [Kk][Dd][Ee]|plasma ]] || \
+    die "Se requiere KDE Plasma; escritorio detectado: ${XDG_CURRENT_DESKTOP:-desconocido}."
+}
+
+require_kde_xremap() {
+  "$XREMAP_BINARY" --list-desktops 2>/dev/null | command grep -qw kde || \
+    die "xremap no incluye el backend KDE requerido."
+}
+
+install_download_dependencies() {
+  local missing=()
+  command -v curl >/dev/null 2>&1 || missing+=(curl)
+  command -v unzip >/dev/null 2>&1 || missing+=(unzip)
+  [[ -e /etc/ssl/certs/ca-certificates.crt ]] || missing+=(ca-certificates)
+  [[ ${#missing[@]} -eq 0 ]] && return
+  command -v apt-get >/dev/null 2>&1 || die "Faltan ${missing[*]} y este sistema no dispone de apt-get."
+  note "Instalando dependencias de descarga: ${missing[*]}"
+  sudo_run apt-get update
+  sudo_run apt-get install -y "${missing[@]}"
+}
+
+install_xremap() {
+  local architecture asset sha256 url temporary_dir archive actual_sha256
+  case "$(uname -m)" in
+    x86_64|amd64)
+      architecture=x86_64
+      sha256=11bf66c1b5e3e4152c7b1c4ce454fdfbc7564f869c7cdf32b1b8b4d399f23cdf
+      ;;
+    aarch64|arm64)
+      architecture=aarch64
+      sha256=fd2336d076bf0bc0655947b095628a7addec7f8c577ab3582568aac91a8b236c
+      ;;
+    *) die "Arquitectura no admitida para la instalación automática: $(uname -m)" ;;
+  esac
+  asset="xremap-linux-$architecture-kde.zip"
+  url="https://github.com/xremap/xremap/releases/download/v$XREMAP_VERSION/$asset"
+  if "$DRY_RUN"; then
+    note "+ instalaría xremap $XREMAP_VERSION (KDE, $architecture) en $MANAGED_XREMAP_DIR tras verificar SHA-256"
+    XREMAP_BINARY="$MANAGED_XREMAP"
+    XREMAP_INSTALLED_BY_SCRIPT=yes
+    return
+  fi
+  install_download_dependencies
+  temporary_dir="$(mktemp -d)"
+  archive="$temporary_dir/$asset"
+  curl --fail --location --proto '=https' --tlsv1.2 --output "$archive" "$url"
+  actual_sha256="$(sha256sum "$archive" | cut -d ' ' -f 1)"
+  [[ "$actual_sha256" == "$sha256" ]] || die "La suma SHA-256 de xremap no coincide; se canceló la instalación."
+  unzip -q "$archive" -d "$temporary_dir/extract"
+  [[ -x "$temporary_dir/extract/xremap" ]] || die "El archivo descargado no contiene el binario xremap esperado."
+  mkdir -p "$MANAGED_XREMAP_DIR"
+  install -m 0755 "$temporary_dir/extract/xremap" "$MANAGED_XREMAP"
+  XREMAP_BINARY="$MANAGED_XREMAP"
+  XREMAP_INSTALLED_BY_SCRIPT=yes
+  if ! "$XREMAP_BINARY" --list-desktops 2>/dev/null | command grep -qw kde; then
+    rm -rf -- "$MANAGED_XREMAP_DIR" "$temporary_dir"
+    die "El binario descargado de xremap no incluye el backend KDE requerido."
+  fi
+  rm -rf -- "$temporary_dir"
+}
+
+ensure_xremap() {
+  if [[ -x "$MANAGED_XREMAP" ]]; then
+    XREMAP_BINARY="$MANAGED_XREMAP"
+  elif command -v xremap >/dev/null 2>&1; then
+    XREMAP_BINARY="$(command -v xremap)"
+  else
+    install_xremap
+  fi
+  if ! "$DRY_RUN"; then
+    require_kde_xremap
+  fi
+}
+
+is_input_member() { id -nG "$USER" | tr ' ' '\n' | command grep -qx input; }
+
+write_config() {
+  run mkdir -p "$CONFIG_DIR"
+  if ! "$DRY_RUN"; then
+    cat >"$CONFIG_FILE" <<'EOF'
+# Gestionado por kde-macos-keymap. No editar: se regenerará con `apply`.
+# Las reglas específicas deben ir antes de la regla general en xremap.
+keymap:
+  - name: Terminal copy and paste
+    application:
+      only: [org.kde.konsole, Konsole, konsole, org.wezfurlong.wezterm, WezTerm, Alacritty, kitty, org.gnome.Terminal]
+    exact_match: true
+    remap:
+      Super-C: C-Shift-C
+      Super-V: C-Shift-V
+
+  - name: macOS-style GUI shortcuts
+    application:
+      not: [org.kde.konsole, Konsole, konsole, org.wezfurlong.wezterm, WezTerm, Alacritty, kitty, org.gnome.Terminal]
+    exact_match: true
+    remap:
+      Super-C: C-C
+      Super-X: C-X
+      Super-V: C-V
+      Super-A: C-A
+      Super-Z: C-Z
+      Super-Shift-Z: C-Shift-Z
+      Super-F: C-F
+      Super-S: C-S
+      Super-Shift-S: C-Shift-S
+      Super-O: C-O
+      Super-N: C-N
+      Super-W: C-W
+      Super-P: C-P
+EOF
+  fi
+}
+
+write_unit() {
+  run mkdir -p "$UNIT_DIR"
+  if ! "$DRY_RUN"; then
+    cat >"$UNIT_FILE" <<EOF
+[Unit]
+Description=Selected macOS-style Command shortcuts for KDE Plasma
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=$XREMAP_BINARY --desktop kde --watch=config,device $CONFIG_FILE
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target
+EOF
+  fi
+}
+
+backup_path() {
+  local source="$1" destination="$2"
+  if [[ -e "$source" ]]; then
+    run mkdir -p "$(dirname "$destination")"
+    if [[ "$source" == /etc/* ]]; then
+      sudo_run cp -a -- "$source" "$destination"
+    else
+      run cp -a -- "$source" "$destination"
+    fi
+  fi
+}
+
+backup() {
+  local stamp backup_dir
+  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  backup_dir="$STATE_DIR/backups/$stamp"
+  run mkdir -p "$backup_dir"
+  backup_path "$CONFIG_FILE" "$backup_dir/user/xremap.yml"
+  backup_path "$UNIT_FILE" "$backup_dir/user/$APP_NAME.service"
+  backup_path "$UDEV_FILE" "$backup_dir/system/$(basename "$UDEV_FILE")"
+  backup_path "$MODULE_FILE" "$backup_dir/system/$(basename "$MODULE_FILE")"
+  if ! "$DRY_RUN"; then
+    {
+      printf 'created_at=%q\n' "$stamp"
+      printf 'user=%q\n' "$USER"
+      printf 'input_member_before=%q\n' "$(is_input_member && printf yes || printf no)"
+      printf 'session_type=%q\n' "${XDG_SESSION_TYPE:-unknown}"
+      printf 'desktop=%q\n' "${XDG_CURRENT_DESKTOP:-unknown}"
+      (cd "$backup_dir" && command sha256sum ./*/* 2>/dev/null || true)
+    } >"$backup_dir/manifest.txt"
+    printf '%s\n' "$backup_dir" >"$STATE_DIR/latest-backup"
+  fi
+  note "Respaldo creado: $backup_dir"
+}
+
+preflight_apply() {
+  [[ "$EUID" -ne 0 ]] || die "Ejecuta el script como usuario normal, sin sudo. Solicitará privilegios solo cuando sean necesarios."
+  require_kde_wayland
+  if [[ -e "$STATE_FILE" ]]; then
+    die "Ya hay una instalación registrada. Ejecuta status o restore antes de aplicar de nuevo."
+  fi
+  for file in "$CONFIG_FILE" "$UNIT_FILE" "$UDEV_FILE" "$MODULE_FILE"; do
+    [[ ! -e "$file" ]] || die "No se sobrescribirá $file. Muévelo o revísalo manualmente."
+  done
+}
+
+apply() {
+  local config_created=no unit_created=no udev_created=no module_created=no input_added=no
+  rollback_failed_apply() {
+    local exit_code=$?
+    trap - ERR
+    note "La aplicación falló; intentando revertir los cambios parciales..." >&2
+    [[ "$unit_created" == yes ]] && systemctl --user disable --now "$APP_NAME.service" >/dev/null 2>&1 || true
+    [[ "$unit_created" == yes ]] && rm -f -- "$UNIT_FILE" || true
+    [[ "$config_created" == yes ]] && rm -f -- "$CONFIG_FILE" || true
+    [[ "$udev_created" == yes ]] && sudo rm -f -- "$UDEV_FILE" || true
+    [[ "$module_created" == yes ]] && sudo rm -f -- "$MODULE_FILE" || true
+    [[ "$input_added" == yes ]] && sudo gpasswd -d "$USER" input >/dev/null 2>&1 || true
+    [[ "$XREMAP_INSTALLED_BY_SCRIPT" == yes ]] && rm -rf -- "$MANAGED_XREMAP_DIR" || true
+    systemctl --user daemon-reload >/dev/null 2>&1 || true
+    exit "$exit_code"
+  }
+  preflight_apply
+  backup
+  trap rollback_failed_apply ERR
+  ensure_xremap
+  write_config
+  config_created=yes
+  write_unit
+  unit_created=yes
+
+  if ! "$DRY_RUN"; then
+    printf '%s\n' 'KERNEL=="uinput", GROUP="input", TAG+="uaccess", MODE:="0660", OPTIONS+="static_node=uinput"' \
+      | sudo tee "$UDEV_FILE" >/dev/null
+    udev_created=yes
+    printf '%s\n' uinput | sudo tee "$MODULE_FILE" >/dev/null
+    module_created=yes
+  else
+    note "+ instalaría $UDEV_FILE y $MODULE_FILE con sudo"
+    udev_created=yes
+    module_created=yes
+  fi
+
+  if ! is_input_member; then
+    sudo_run usermod -aG input "$USER"
+    input_added=yes
+  fi
+  sudo_run modprobe uinput
+  sudo_run udevadm control --reload-rules
+  sudo_run udevadm trigger
+
+  run systemctl --user daemon-reload
+  run systemctl --user enable "$APP_NAME.service"
+  if [[ "$input_added" == no ]]; then
+    run systemctl --user start "$APP_NAME.service"
+  fi
+
+  if ! "$DRY_RUN"; then
+    run mkdir -p "$STATE_DIR"
+    {
+      printf 'input_added=%q\n' "$input_added"
+      printf 'udev_file=%q\n' "$UDEV_FILE"
+      printf 'module_file=%q\n' "$MODULE_FILE"
+      printf 'config_file=%q\n' "$CONFIG_FILE"
+      printf 'unit_file=%q\n' "$UNIT_FILE"
+      printf 'xremap_installed=%q\n' "$XREMAP_INSTALLED_BY_SCRIPT"
+    } >"$STATE_FILE"
+  fi
+  trap - ERR
+  if [[ "$input_added" == yes ]]; then
+    note "Aplicado. Cierra sesión y vuelve a entrar; el servicio se iniciará entonces con el grupo input activo."
+  else
+    note "Aplicado y servicio iniciado."
+  fi
+}
+
+restore() {
+  [[ -f "$STATE_FILE" ]] || die "No hay una instalación registrada por $APP_NAME. No se modificó nada."
+  local input_added="" xremap_installed="" key value
+  while IFS='=' read -r key value; do
+    [[ "$key" == input_added ]] && input_added="$value"
+    [[ "$key" == xremap_installed ]] && xremap_installed="$value"
+  done <"$STATE_FILE"
+  [[ "$input_added" == yes || "$input_added" == no ]] || die "El archivo de estado no es válido; no se modificó nada."
+  [[ "$xremap_installed" == yes || "$xremap_installed" == no ]] || die "El archivo de estado no es válido; no se modificó nada."
+  run systemctl --user disable --now "$APP_NAME.service" || true
+  run rm -f -- "$UNIT_FILE" "$CONFIG_FILE"
+  sudo_run rm -f -- "$UDEV_FILE" "$MODULE_FILE"
+  if [[ "$input_added" == yes ]]; then
+    sudo_run gpasswd -d "$USER" input
+  fi
+  if "$PURGE_XREMAP" && [[ "$xremap_installed" == yes ]]; then
+    run rm -rf -- "$MANAGED_XREMAP_DIR"
+  fi
+  run systemctl --user daemon-reload
+  run rm -f -- "$STATE_FILE"
+  note "Restauración terminada. Cierra sesión y vuelve a entrar para actualizar grupos y dispositivos."
+}
+
+status() {
+  note "Configuración: $CONFIG_FILE"
+  [[ -f "$CONFIG_FILE" ]] && note "  configuración: presente" || note "  configuración: ausente"
+  [[ -f "$STATE_FILE" ]] && note "  instalación registrada: sí" || note "  instalación registrada: no"
+  [[ "${XDG_SESSION_TYPE:-}" == wayland ]] && note "  sesión Wayland: sí" || note "  sesión Wayland: no"
+  command -v xremap >/dev/null && note "  xremap: $(command -v xremap)" || note "  xremap: no encontrado"
+  is_input_member && note "  grupo input: sí" || note "  grupo input: no (puede requerir relogin)"
+  [[ -e /dev/uinput ]] && note "  /dev/uinput: presente" || note "  /dev/uinput: ausente"
+  [[ -x "$MANAGED_XREMAP" ]] && note "  xremap administrado: $MANAGED_XREMAP" || true
+  systemctl --user is-active --quiet "$APP_NAME.service" && note "  servicio: activo" || note "  servicio: inactivo"
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dry-run) DRY_RUN=true; shift ;;
+    help|--help|-h) usage; exit 0 ;;
+    --purge)
+      PURGE_XREMAP=true
+      shift
+      ;;
+    status|backup|apply|restore) command_name="$1"; shift ;;
+    *) die "Argumento desconocido: $1" ;;
+  esac
+done
+
+[[ "${command_name:-}" ]] || { usage; exit 1; }
+[[ $# -eq 0 ]] || die "Solo se admite un comando."
+if "$PURGE_XREMAP" && [[ "$command_name" != restore ]]; then
+  die "--purge solo se puede usar con restore."
+fi
+"$command_name"
